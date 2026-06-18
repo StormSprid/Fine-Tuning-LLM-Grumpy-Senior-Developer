@@ -1,0 +1,575 @@
+{
+  "cells": [
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "SDWgDuuZwqFP"
+      },
+      "source": [
+        "# QLoRA Fine-tuning: Mistral-7B Grumpy Senior\n",
+        "**Goal**: Обучить Mistral-7B отвечать как грубый синьор, который ворчит, но технически точен.\n",
+        "\n",
+        "**Hardware**: Google Colab T4 GPU  \n",
+        "**Method**: QLoRA (Quantized LoRA) — 4-bit quantization + Low-Rank Adaptation  \n",
+        "**Dataset**: 200 пар instruction/response из `grumpy_senior.jsonl`"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "import os\n",
+        "os.environ[\"USE_TF\"] = \"0\"\n",
+        "os.environ[\"USE_TORCH\"] = \"1\"\n",
+        "\n",
+        "!pip install -q torch==2.4.1 --index-url https://download.pytorch.org/whl/cu118\n",
+        "!pip install -q transformers==4.40.2 peft==0.11.1 bitsandbytes==0.43.1 datasets==2.19.0 accelerate==0.30.1 trl==0.9.6\n",
+        "!pip install -q mlflow==2.9.2\n",
+        "\n",
+        "import torch, transformers, peft, bitsandbytes, mlflow\n",
+        "\n",
+        "print(f\"{torch.__version__}, GPU: {torch.cuda.is_available()}\")\n",
+        "print(f\"protobuf: {__import__('google.protobuf', fromlist=['__version__']).__version__}\")\n",
+        "print(f\"Transformers: {transformers.__version__}, PEFT: {peft.__version__}\")\n",
+        "print(f\"MLflow: {mlflow.__version__}\")"
+      ],
+      "metadata": {
+        "id": "BgPPDDEwE84v"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "mlflow.set_experiment(\"grumpy-senior-qlora\")\n",
+        "mlflow.start_run(run_name=\"mistral-7b-qlora\")\n",
+        "\n",
+        "mlflow.log_params({\n",
+        "    \"model\": \"mistralai/Mistral-7B-v0.1\",\n",
+        "    \"lora_r\": 16,\n",
+        "    \"lora_alpha\": 32,\n",
+        "    \"lora_dropout\": 0.05,\n",
+        "    \"learning_rate\": 2e-4,\n",
+        "    \"num_epochs\": 3,\n",
+        "    \"batch_size\": 2,\n",
+        "    \"gradient_accumulation_steps\": 4,\n",
+        "    \"quantization\": \"4-bit NF4\",\n",
+        "    \"dataset_size\": 200,\n",
+        "})\n",
+        "\n",
+        "print(f\"MLflow run started: {mlflow.active_run().info.run_id}\")"
+      ],
+      "metadata": {
+        "id": "QoAji3ngsHEY"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "6eDPcSa7wqFR"
+      },
+      "outputs": [],
+      "source": [
+        "# Тест ГПУ\n",
+        "!nvidia-smi --query-gpu=name,memory.total --format=csv,noheader"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "kJN3jZEawqFT"
+      },
+      "outputs": [],
+      "source": [
+        "import json\n",
+        "import os\n",
+        "from datasets import Dataset\n",
+        "from pathlib import Path\n",
+        "\n",
+        "\n",
+        "DATASET_PATH = \"/content/grumpy_senior.jsonl\"\n",
+        "OUTPUT_DIR = \"/content/mistral-grumpy-lora\"\n",
+        "\n",
+        "\n",
+        "\n",
+        "data = []\n",
+        "if os.path.exists(DATASET_PATH):\n",
+        "    with open(DATASET_PATH, 'r', encoding='utf-8') as f:\n",
+        "        for line in f:\n",
+        "            if line.strip():\n",
+        "                data.append(json.loads(line))\n",
+        "    print(f\"Загружено {len(data)} примеров\")\n",
+        "else:\n",
+        "    print(f\"Файл не найден: {DATASET_PATH}\")\n",
+        "    print(f\"Доступные файлы в /content:\")\n",
+        "    print(os.listdir(\"/content\"))\n",
+        "\n",
+        "\n",
+        "if data:\n",
+        "    print(\"\\n--- Пример 1 ---\")\n",
+        "    print(f\"Instruction: {data[0]['instruction']}\")\n",
+        "    print(f\"Response: {data[0]['response'][:200]}...\")"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "TbPFBwBIwqFT"
+      },
+      "outputs": [],
+      "source": [
+        "\n",
+        "dataset = Dataset.from_dict({\n",
+        "    'instruction': [item['instruction'] for item in data],\n",
+        "    'response': [item['response'] for item in data]\n",
+        "})\n",
+        "\n",
+        "\n",
+        "split = dataset.train_test_split(test_size=0.1, seed=42)\n",
+        "train_dataset = split['train']\n",
+        "val_dataset = split['test']\n",
+        "\n",
+        "print(f\"Train: {len(train_dataset)}\")\n",
+        "print(f\"Val: {len(val_dataset)}\")"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "WSlw2scNwqFT"
+      },
+      "outputs": [],
+      "source": [
+        "def formatting_func(examples):\n",
+        "    \"\"\"Преобразуем instruction/response в text для обучения\"\"\"\n",
+        "    output_texts = []\n",
+        "\n",
+        "    for i in range(len(examples['instruction'])):\n",
+        "        text = f\"\"\"[INST] {examples['instruction'][i]} [/INST]\n",
+        "{examples['response'][i]}</s>\"\"\"\n",
+        "        output_texts.append(text)\n",
+        "\n",
+        "    return {\"text\": output_texts}\n",
+        "\n",
+        "\n",
+        "train_dataset = train_dataset.map(\n",
+        "    formatting_func,\n",
+        "    batched=True,\n",
+        "    remove_columns=['instruction', 'response']\n",
+        ")\n",
+        "\n",
+        "val_dataset = val_dataset.map(\n",
+        "    formatting_func,\n",
+        "    batched=True,\n",
+        "    remove_columns=['instruction', 'response']\n",
+        ")\n",
+        "\n",
+        "print(f\"✓ Dataset formatted\")\n",
+        "print(f\"\\nПример обучающей строки:\")\n",
+        "print(train_dataset[0]['text'][:300])"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "aC-0gdZiwqFU"
+      },
+      "outputs": [],
+      "source": [
+        "from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig\n",
+        "import torch\n",
+        "\n",
+        "# параметры квантизации\n",
+        "bnb_config = BitsAndBytesConfig(\n",
+        "    load_in_4bit=True,\n",
+        "    bnb_4bit_quant_type=\"nf4\",\n",
+        "    bnb_4bit_use_double_quant=True,\n",
+        "    bnb_4bit_compute_dtype=torch.bfloat16\n",
+        ")\n",
+        "\n",
+        "model_name = \"mistralai/Mistral-7B-v0.1\"\n",
+        "print(f\"Loading {model_name}...\")\n",
+        "\n",
+        "\n",
+        "model = AutoModelForCausalLM.from_pretrained(\n",
+        "    model_name,\n",
+        "    quantization_config=bnb_config,\n",
+        "    device_map=\"auto\",\n",
+        "    trust_remote_code=True\n",
+        ")\n",
+        "\n",
+        "\n",
+        "tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)\n",
+        "tokenizer.pad_token = tokenizer.eos_token\n",
+        "\n",
+        "print(f\"✓ Model loaded: {model_name}\")\n",
+        "print(f\"  Total params: {sum(p.numel() for p in model.parameters()) / 1e9:.1f}B\")"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "6PxqfyHowqFU"
+      },
+      "outputs": [],
+      "source": [
+        "from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training\n",
+        "\n",
+        "\n",
+        "model = prepare_model_for_kbit_training(model)\n",
+        "\n",
+        "\n",
+        "lora_config = LoraConfig(\n",
+        "    r=16,\n",
+        "    lora_alpha=32,\n",
+        "    target_modules=[\n",
+        "        \"q_proj\",\n",
+        "        \"k_proj\",\n",
+        "        \"v_proj\",\n",
+        "        \"o_proj\",\n",
+        "        \"gate_proj\",\n",
+        "        \"up_proj\",\n",
+        "        \"down_proj\"\n",
+        "    ],\n",
+        "    lora_dropout=0.05,\n",
+        "    bias=\"none\",\n",
+        "    task_type=\"CAUSAL_LM\"\n",
+        ")\n",
+        "\n",
+        "\n",
+        "model = get_peft_model(model, lora_config)\n",
+        "\n",
+        "\n",
+        "trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)\n",
+        "total_params = sum(p.numel() for p in model.parameters())\n",
+        "\n",
+        "print(f\"LoRA applied\")\n",
+        "print(f\"Trainable params: {trainable_params / 1e6:.2f}M\")\n",
+        "print(f\"Total params: {total_params / 1e9:.2f}B\")\n",
+        "print(f\"Trainable %: {100 * trainable_params / total_params:.2f}%\")"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "uZmqOwi_wqFU"
+      },
+      "outputs": [],
+      "source": [
+        "from transformers import TrainingArguments, Trainer\n",
+        "\n",
+        "training_args = TrainingArguments(\n",
+        "    output_dir=OUTPUT_DIR,\n",
+        "    num_train_epochs=3,\n",
+        "    per_device_train_batch_size=2,\n",
+        "    per_device_eval_batch_size=4,\n",
+        "    gradient_accumulation_steps=4,\n",
+        "    learning_rate=2e-4,\n",
+        "    lr_scheduler_type=\"cosine\",\n",
+        "    warmup_steps=20,\n",
+        "    weight_decay=0.01,\n",
+        "    optim=\"paged_adamw_8bit\",\n",
+        "    save_strategy=\"epoch\",\n",
+        "    evaluation_strategy=\"steps\",\n",
+        "    eval_steps=10,\n",
+        "    save_total_limit=2,\n",
+        "    logging_steps=5,\n",
+        "    logging_dir=f\"{OUTPUT_DIR}/logs\",\n",
+        "    report_to=\"mlflow\",\n",
+        "    run_name=\"mistral-grumpy-qlora\",\n",
+        "    seed=42,\n",
+        "    fp16=True,\n",
+        "    gradient_checkpointing=True,\n",
+        "    remove_unused_columns=False,\n",
+        ")\n",
+        "\n",
+        "print(\"Training arguments configured\")"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "def tokenize_func(examples):\n",
+        "    tokenized = tokenizer(\n",
+        "        examples[\"text\"],\n",
+        "        truncation=True,\n",
+        "        max_length=512,\n",
+        "        padding=False,\n",
+        "    )\n",
+        "    tokenized[\"labels\"] = tokenized[\"input_ids\"].copy()\n",
+        "    return tokenized\n",
+        "\n",
+        "train_dataset = train_dataset.map(tokenize_func, batched=True, remove_columns=[\"text\"])\n",
+        "val_dataset = val_dataset.map(tokenize_func, batched=True, remove_columns=[\"text\"])\n",
+        "\n",
+        "print(f\"✓ Train: {len(train_dataset)}, Val: {len(val_dataset)}\")\n",
+        "print(f\"  Колонки: {train_dataset.column_names}\")"
+      ],
+      "metadata": {
+        "id": "NWuvTVQyQe37"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "from transformers import DataCollatorForSeq2Seq\n",
+        "\n",
+        "trainer = Trainer(\n",
+        "    model=model,\n",
+        "    args=training_args,\n",
+        "    train_dataset=train_dataset,\n",
+        "    eval_dataset=val_dataset,\n",
+        "    data_collator=DataCollatorForSeq2Seq(\n",
+        "        tokenizer=tokenizer,\n",
+        "        model=model,\n",
+        "        padding=True,\n",
+        "        pad_to_multiple_of=8\n",
+        "    ),\n",
+        ")\n",
+        "print(\"Trainer initialized\")"
+      ],
+      "metadata": {
+        "id": "_Qh9JaepQkyz"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "6Tv-IBh1wqFU"
+      },
+      "outputs": [],
+      "source": [
+        "# Запускаем обучение\n",
+        "train_result = trainer.train()\n",
+        "\n",
+        "print(\"\\n\" + \"=\"*50)\n",
+        "print(\"Training completed!\")\n",
+        "print(f\"Final loss: {train_result.training_loss:.4f}\")\n",
+        "print(\"=\"*50)"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "mlflow.log_metric(\"final_train_loss\", train_result.training_loss)\n",
+        "mlflow.end_run()\n",
+        "print(f\"MLflow run завершён\")"
+      ],
+      "metadata": {
+        "id": "ouAG1SehtXg_"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "8aKuBHFPwqFU"
+      },
+      "outputs": [],
+      "source": [
+        "# Сохраняем только адаптер\n",
+        "adapter_dir = f\"{OUTPUT_DIR}/adapter\"\n",
+        "model.save_pretrained(adapter_dir)\n",
+        "\n",
+        "\n",
+        "tokenizer.save_pretrained(adapter_dir)\n",
+        "\n",
+        "print(f\"LoRA adapter saved to: {adapter_dir}\")\n",
+        "print(f\"\\nМожно загрузить так:\")\n",
+        "print(f\"\"\"\n",
+        "from peft import AutoPeftModelForCausalLM\n",
+        "from transformers import AutoTokenizer\n",
+        "\n",
+        "model = AutoPeftModelForCausalLM.from_pretrained(\n",
+        "    \\\"{adapter_dir}\\\",\n",
+        "    device_map=\\\"auto\\\"\n",
+        ")\n",
+        "tokenizer = AutoTokenizer.from_pretrained(\\\"{adapter_dir}\\\")\n",
+        "\"\"\")"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "PXuwHv8EwqFV"
+      },
+      "outputs": [],
+      "source": [
+        "# Проверяем размер адаптера\n",
+        "import os\n",
+        "from pathlib import Path\n",
+        "\n",
+        "adapter_size = sum(f.stat().st_size for f in Path(adapter_dir).rglob('*') if f.is_file()) / 1e6\n",
+        "print(f\"Adapter size: {adapter_size:.1f} MB\")\n",
+        "print(f\"\\nСохранённые файлы:\")\n",
+        "for f in sorted(os.listdir(adapter_dir)):\n",
+        "    path = os.path.join(adapter_dir, f)\n",
+        "    if os.path.isfile(path):\n",
+        "        size = os.path.getsize(path) / 1e6\n",
+        "        print(f\"  {f}: {size:.2f} MB\")"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "7lZRHPu2wqFV"
+      },
+      "outputs": [],
+      "source": [
+        "\n",
+        "model.eval()\n",
+        "\n",
+        "# Тестовые вопросы\n",
+        "test_prompts = [\n",
+        "    \"Как настроить Docker контейнер?\",\n",
+        "    \"Объясни SQL join\",\n",
+        "    \"Что такое async/await в JavaScript?\"\n",
+        "]\n",
+        "\n",
+        "print(\"Testing fine-tuned model:\")\n",
+        "print(\"=\"*60)\n",
+        "\n",
+        "for prompt in test_prompts:\n",
+        "    input_text = f\"[INST] {prompt} [/INST]\"\n",
+        "    inputs = tokenizer(input_text, return_tensors=\"pt\").to(model.device)\n",
+        "\n",
+        "    with torch.no_grad():\n",
+        "        output = model.generate(\n",
+        "            **inputs,\n",
+        "            max_length=300,\n",
+        "            temperature=0.7,\n",
+        "            top_p=0.9,\n",
+        "            do_sample=True,\n",
+        "            eos_token_id=tokenizer.eos_token_id\n",
+        "        )\n",
+        "\n",
+        "    response = tokenizer.decode(output[0], skip_special_tokens=True)\n",
+        "\n",
+        "    if \"[/INST]\" in response:\n",
+        "        response = response.split(\"[/INST]\")[-1].strip()\n",
+        "\n",
+        "    print(f\"\\nQ: {prompt}\")\n",
+        "    print(f\"A: {response[:200]}...\\n\")\n",
+        "    print(\"-\"*60)"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "wpNO6z2wwqFV"
+      },
+      "outputs": [],
+      "source": [
+        "\n",
+        "print(\"\\n\" + \"=\"*60)\n",
+        "print(\"Fine-tuning complete!\")\n",
+        "print(\"=\"*60)\n",
+        "print(f\"\\nРезультаты:\")\n",
+        "print(f\"  • Модель: Mistral-7B-v0.1\")\n",
+        "print(f\"  • Метод: QLoRA (4-bit quantization)\")\n",
+        "print(f\"  • Примеров: {len(train_dataset)} train, {len(val_dataset)} val\")\n",
+        "print(f\"  • Адаптер сохранён в: {adapter_dir}\")\n",
+        "print(f\"  • Размер адаптера: {adapter_size:.1f} MB\")\n",
+        "print(f\"\\nДля загрузки в production:\")\n",
+        "print(f\"  1. Скачай содержимое {adapter_dir}\")\n",
+        "print(f\"  2. Используй AutoPeftModelForCausalLM.from_pretrained()\")\n"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "!mlflow ui --port 5000 &\n",
+        "import time\n",
+        "time.sleep(2)\n",
+        "from google.colab.output import eval_js\n",
+        "print(eval_js(\"google.colab.kernel.proxyPort(5000)\"))"
+      ],
+      "metadata": {
+        "id": "EbQ920ZZtcre"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "import matplotlib.pyplot as plt\n",
+        "import mlflow\n",
+        "\n",
+        "client = mlflow.tracking.MlflowClient()\n",
+        "experiment = client.get_experiment_by_name(\"grumpy-senior-qlora\")\n",
+        "\n",
+        "run_id = \"c0350fa973334b11986e5fbc65a396e1\"\n",
+        "\n",
+        "\n",
+        "train_loss_history = client.get_metric_history(run_id, \"loss\")\n",
+        "val_loss_history = client.get_metric_history(run_id, \"eval_loss\")\n",
+        "\n",
+        "train_steps = [m.step for m in train_loss_history]\n",
+        "train_values = [m.value for m in train_loss_history]\n",
+        "\n",
+        "val_steps = [m.step for m in val_loss_history]\n",
+        "val_values = [m.value for m in val_loss_history]\n",
+        "\n",
+        "\n",
+        "plt.figure(figsize=(10, 5))\n",
+        "plt.plot(train_steps, train_values, label='Train Loss', marker='o', color='blue')\n",
+        "plt.plot(val_steps, val_values, label='Val Loss', marker='o', color='orange')\n",
+        "plt.xlabel('Steps')\n",
+        "plt.ylabel('Loss')\n",
+        "plt.title('QLoRA Fine-tuning: Mistral-7B Grumpy Senior')\n",
+        "plt.legend()\n",
+        "plt.grid(True)\n",
+        "plt.tight_layout()\n",
+        "\n",
+        "\n",
+        "plt.savefig('/content/loss_curve.png', dpi=150)\n",
+        "mlflow.log_artifact('/content/loss_curve.png')\n",
+        "plt.show()\n",
+        "print(\"✓ График сохранён и залогирован в MLflow\")"
+      ],
+      "metadata": {
+        "id": "npyN4l0z2HS9"
+      },
+      "execution_count": null,
+      "outputs": []
+    }
+  ],
+  "metadata": {
+    "accelerator": "GPU",
+    "colab": {
+      "gpuType": "T4",
+      "provenance": []
+    },
+    "kernelspec": {
+      "display_name": "Python 3",
+      "language": "python",
+      "name": "python3"
+    },
+    "language_info": {
+      "name": "python",
+      "version": "3.10.0"
+    }
+  },
+  "nbformat": 4,
+  "nbformat_minor": 0
+}
