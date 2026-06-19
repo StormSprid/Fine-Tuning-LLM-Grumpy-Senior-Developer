@@ -1,17 +1,12 @@
-import os
 import json
 import time
 import logging
 import sys
 from pathlib import Path
 
-import requests
-from dotenv import load_dotenv
-
 sys.path.insert(0, str(Path(__file__).parents[2]))
 from src.data.questions import QUESTIONS
-
-load_dotenv()
+from src.llm_client import LLMClient
 
 logging.basicConfig(
     level=logging.INFO,
@@ -19,10 +14,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-API_URL = os.getenv("DO_API_URL", "https://inference.do-ai.run/v1/chat/completions")
-API_KEY = os.getenv("DO_API_KEY", "")
-MODEL = os.getenv("DO_MODEL", "deepseek-4-flash")
-DELAY = float(os.getenv("GENERATION_DELAY", "1.5"))
+DELAY = 1.5
 
 DATA_DIR = Path(__file__).parents[2] / "data"
 RAW_OUTPUT = DATA_DIR / "grumpy_senior_raw.jsonl"
@@ -41,30 +33,19 @@ SYSTEM_PROMPT = """Ты — Senior Full-stack Engineer с 15 годами опы
 7. Не более 250 слов в ответе"""
 
 
-def call_api(question: str, retries: int = 3) -> str | None:
-    headers = {
-        "Authorization": f"Bearer {API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": MODEL,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": question},
-        ],
-        "temperature": 0.8,
-        "max_tokens": 500,
-    }
-    for attempt in range(retries):
-        try:
-            response = requests.post(API_URL, headers=headers, json=payload, timeout=30)
-            response.raise_for_status()
-            return response.json()["choices"][0]["message"]["content"].strip()
-        except Exception as e:
-            logger.warning(f"Attempt {attempt + 1}/{retries} failed: {e}")
-            if attempt < retries - 1:
-                time.sleep(2**attempt)
-    return None
+def call_api(question: str) -> str | None:
+    try:
+        return LLMClient().chat(
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": question},
+            ],
+            temperature=0.8,
+            max_tokens=500,
+        )
+    except RuntimeError as e:
+        logger.error(e)
+        return None
 
 
 def load_existing_instructions(path: Path) -> set[str]:
@@ -81,10 +62,6 @@ def load_existing_instructions(path: Path) -> set[str]:
 
 
 def generate_dataset() -> None:
-    if not API_KEY:
-        logger.error("DO_API_KEY не задан. Добавь токен в .env файл.")
-        sys.exit(1)
-
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     all_questions = [q for qs in QUESTIONS.values() for q in qs]

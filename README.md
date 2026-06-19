@@ -7,19 +7,24 @@
 ```
 .
 |--- data/
-|   |--- grumpy_senior_raw.jsonl     # сырые ответы API (200 примеров)
-|   |--- grumpy_senior.jsonl         # финальный датасет после очистки
+|   |--- grumpy_senior_raw.jsonl       # сырые ответы API (200 примеров)
+|   |--- grumpy_senior.jsonl           # финальный датасет после очистки
+|   |--- finetuned_responses.jsonl     # ответы fine-tuned модели (10 вопросов)
+|   |--- base_responses.jsonl          # ответы базовой модели (10 вопросов)
+|   |--- evaluation_results.json       # результаты LLM-as-judge
 |--- src/
 |   |--- data/
-|       |--- questions.py            # 200 вопросов (20 тем × 10)
-|       |--- generate_dataset.py     # генерация датасета через DO API
-|       |--- clean_dataset.py        # дедупликация и фильтрация качества
-|       |--- test_questions.py       # 20 вопросов для оценки (не из трейна)
+|       |--- questions.py              # 200 вопросов (20 тем × 10)
+|       |--- generate_dataset.py       # генерация датасета через DO API
+|       |--- clean_dataset.py          # дедупликация и фильтрация качества
+|   |--- evaluate.py                   # A/B тест + LLM-as-judge
 |--- notebooks/
-|   |--- finetune_lora_1.2.0        # QLoRA fine-tuning (Google Colab)
-|--- screenshots/                    # скриншоты loss curve и MLflow
+|   |--- finetune_lora_1.3.0.ipynb    # QLoRA fine-tuning (Google Colab)
+|--- screenshots/
+|   |--- loss_curve.png                # loss curve обучения
+|   |--- evaluation_chart.png          # график оценки
 |--- tests/
-|   |--- test_llm_connection.py      # проверка связи с API
+|   |--- test_llm_connection.py        # проверка связи с API
 |--- .env.example
 ```
 
@@ -76,11 +81,11 @@ poetry run python src/data/clean_dataset.py
 
 ### Подход
 
-**QLoRA**  на базе `mistralai/Mistral-7B-v0.1`, запускается в Google Colab (T4 GPU).
+**QLoRA** на базе `mistralai/Mistral-7B-v0.1`, запускается в Google Colab (T4 GPU).
 
 - 4-bit quantization (NF4) через `bitsandbytes` — влезает в 15 GB VRAM
 - HuggingFace `peft` + `transformers` + `trl`
-- Логирование через **MLflow**
+- Логирование через MLflow
 - Формат промпта: `[INST] {instruction} [/INST]\n{response}</s>`
 
 ### Гиперпараметры
@@ -99,9 +104,19 @@ poetry run python src/data/clean_dataset.py
 | Optimizer | paged_adamw_8bit |
 | Quantization | 4-bit NF4 + double quant |
 
+### Loss Curve
+
+![Loss Curve](screenshots/loss_curve.png)
+
+| Метрика | Значение |
+|---|---|
+| Final train loss | 0.9196 |
+| Final val loss | 1.21 |
+| Время обучения | ~25 минут |
+
 ### Запуск
 
-1. Открыть `notebooks/finetune_lora_1.2.0` в Google Colab (Runtime → T4 GPU)
+1. Открыть `notebooks/finetune_lora_1.3.0.ipynb` в Google Colab (Runtime → T4 GPU)
 2. Загрузить `data/grumpy_senior.jsonl` в `/content/`
 3. Запустить все ячейки
 
@@ -110,7 +125,7 @@ poetry run python src/data/clean_dataset.py
 ### Артефакты
 
 - MLflow run ID: `c0350fa973334b11986e5fbc65a396e1`
-- Loss curve: см. `screenshots/`
+- Loss curve: см. `screenshots/loss_curve.png`
 
 ---
 
@@ -118,19 +133,51 @@ poetry run python src/data/clean_dataset.py
 
 ### Подход
 
-Сравнение **base модели** и **base + LoRA адаптер** на 20 тестовых вопросах из `src/data/test_questions.py` (не из обучающего сета, по одному на каждую из 20 тем).
+Сравнение **базовой Mistral-7B** и **Mistral-7B + LoRA адаптер** на 10 тестовых вопросах (не из обучающего сета).
 
-**Метрики:**
-1. **BERTScore** — семантическое сходство с эталонными ответами ворчливого синьора
-2. **LLM-as-judge (Claude API)** — попарное сравнение ответов, win rate
+**Метод:** LLM-as-judge через DeepSeek API — попарное сравнение ответов по трём критериям.
+
+```bash
+poetry run python src/evaluate.py
+```
 
 ### Результаты
 
-_Будет заполнено после завершения обучения_
+| Метрика | Fine-tuned | Базовая |
+|---|---|---|
+| Ворчливость / стиль | **7.9/10** | ~2/10 |
+| Техническая точность | 5.8/10 | ~7/10 |
+| Полезность | 4.5/10 | ~7/10 |
+| Побед (win rate) | 2/10 | 8/10 |
+
+![Evaluation Chart](screenshots/evaluation_chart.png)
+
+### A/B сравнение (примеры)
+
+| Вопрос | Базовая Mistral-7B | Fine-tuned (Grumpy Senior) |
+|---|---|---|
+| Как работает Git rebase? | Git rebase is a command that replays commits on top of another branch... | О, великий ребейс. Действительно, неужели все эти годы git merge тебя устраивал?.. |
+| Что такое Docker volume? | Docker volumes are a mechanism for persisting data... | Очередной вопрос, который можно было задать гуглом за 30 секунд... |
+| Объясни SQL JOIN | A JOIN clause combines rows from two or more tables... | Ох, ну ладно. JOIN — это синтаксический сахар, позволяющий соединить... |
 
 ### Выводы
 
-_Будет заполнено после завершения обучения_
+**Что получилось:**
+- Модель успешно усвоила стиль — ворчливость стабильно 7-9/10 на всех вопросах
+- Характер «синьора» присутствует: пассивная агрессия, отсылки к документации, вздохи
+
+**Что пошло не так:**
+- Базовая модель выигрывает по качеству ответов (8/10 побед)
+- Fine-tuned модель жертвует полезностью ради стиля (4.5/10 против ~7/10 у базовой)
+- Техническая точность упала с ~7/10 до 5.8/10
+
+Почему так?
+- Маленький датасет — 200 примеров недостаточно для баланса стиля и качества
+- Признаки переобучения на стиль
+
+Возможные улучшения:
+- Увеличить датасет до 1000+ примеров с сохранением технической точности
+- Более строгая фильтрация датасета: отсеивать ответы где стиль доминирует над содержанием
 
 ---
 
@@ -142,7 +189,7 @@ poetry install
 
 # Переменные окружения
 cp .env.example .env
-# Заполнить DO_API_KEY, CLAUDE_API_KEY
+# Заполнить DO_API_KEY, DEEPSEEK_API_KEY
 ```
 
 ## Зависимости
@@ -158,5 +205,5 @@ cp .env.example .env
 - `mlflow==2.9.2` — логирование
 
 **Phase 3 (оценка):**
-- `evaluate`, `bert-score` — метрики
-- `anthropic` — LLM-as-judge через Claude API
+- `matplotlib` — графики
+- `requests` — DeepSeek API (LLM-as-judge)
